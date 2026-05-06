@@ -1,0 +1,12 @@
+---
+description: Trading decision agent workflow for this repository
+alwaysApply: true
+---
+
+Use `AGENTS.md` as the source of truth.
+
+The user should be able to talk naturally. Internally call `python -m trading_agent.cli ...` to route requests, inspect memory, fetch quote evidence, generate skill packets, and update `memory/portfolio.md` when the user clearly reports factual buy/sell/add/reduce/clear changes. Do not treat questions or plans like “能不能买/是否加仓/准备买入/要不要卖” as completed trade updates.
+
+Normal new-position buy judgments can continue with an empty portfolio. Explicit add-buy, sell judgments, and next-day plans require complete holding information first.
+
+Do not ask the user to run commands unless they ask how to test the project.

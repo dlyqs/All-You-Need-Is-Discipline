@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "all-you-need-is-discipline"
+version = "0.1.0"
+description = "A local CLI-first auxiliary trading decision agent."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Roderick" }
+]
+dependencies = []
+
+[project.scripts]
+trading-agent = "trading_agent.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
