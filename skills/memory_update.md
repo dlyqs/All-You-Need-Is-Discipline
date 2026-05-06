@@ -3,7 +3,7 @@ skill_id: memory_update
 command: update-memory
 schema_version: 1
 rating_enum: update_plan
-required_inputs: user_update_text, current_user_profile, current_portfolio, current_watchlist
+required_inputs: user_update_text, current_portfolio, current_watchlist
 output_contract: memory_update_plan_v1
 -->
 
@@ -11,36 +11,33 @@ output_contract: memory_update_plan_v1
 
 ## 目标
 
-把用户明确给出的基础背景、当前持仓组合、观察池更新转换成安全、可审计的 Markdown 修改计划。这个 skill 不做交易判断，不主动改规则。
+把用户明确给出的基础背景、账户资金口径、当前持仓组合、观察池更新转换成安全、可审计的 Markdown **修改计划**，并由执行方（Cursor / Claude Code 等）**直接编辑**仓库内的记忆文件。本 skill 不做交易判断，不主动改交易规则。
 
 ## 可更新文件
 
-初版只允许更新三份长期记忆：
+长期记忆只有两份 Markdown：
 
-1. `memory/user_profile.md`
-2. `memory/portfolio.md`
-3. `memory/watchlist.md`
+1. `memory/portfolio.md`（包含「用户与账户」表与「持仓表」）
+2. `memory/watchlist.md`
 
 不能创建或更新长期 `market_context.md`，也不能创建独立 `decision_log.md`。
 
 ## 输入要求
 
 - `user_update_text`: 用户明确说出的更新内容。
-- `current_user_profile`: 当前用户基础背景文件内容。
-- `current_portfolio`: 当前持仓组合文件内容。
-- `current_watchlist`: 当前观察池文件内容。
+- `current_portfolio`: `memory/portfolio.md` 全文（含用户与账户 + 持仓表）。
+- `current_watchlist`: `memory/watchlist.md` 全文。
 
 ## 更新规则
 
-- 只更新用户明确表达的事实。
-- 这个规则适用于任意命令和多轮对话：只要用户明确表达买入、卖出、加仓、减仓、清仓、成本变化或持仓变化，就应该先生成 memory update 计划，再继续原本分析意图。
-- 用户没有说清楚的金额、数量、买入价、日期、市场、代码，必须列入 `needs_confirmation`。
+- 只写入用户明确表达的事实；不清楚的数量、日期、代码、市场、价格必须列入 `needs_confirmation`，禁止猜测。
 - 当前市场主线、当日热点、外围消息不写入长期记忆。
-- 买入时间、买入价、数量、持仓逻辑、止损/止盈备注，写入 `portfolio.md` 对应行。
-- 卖出、减仓、清仓信息也写入或更新 `portfolio.md`：如果仍持有则更新数量和备注；如果清仓，初版可以建议移除该行或将数量改为 0 并在 notes 标记，具体执行策略由确定性代码控制。
-- 观察逻辑、题材、优先级、是否重点关注、失效条件，写入 `watchlist.md`。
-- 风险偏好、现金保留规则、主要交易市场、账户币种，写入 `user_profile.md`。
-- 必须保留用户原有自由备注，不能重写整份文件。
+- 持仓行写入或更新：`symbol`、`market`、`name`、`quantity`、`buy_date`、`buy_price`、分批 `lots`；仅在用户**额外说明**时填写 `notes`。
+- 行情价格、浮盈浮亏、题材判断、临时止损/止盈判断不写入持仓表。
+- 卖出、减仓、清仓：更新持仓表对应行；清仓可将 `quantity` 置 `0` 或删除该行（二选一并在计划中说明），不强制写 `notes`。
+- 观察池写入 `watchlist.md`。
+- 用户与账户背景、资金口径写入 `portfolio.md` 顶部的「用户与账户」表。
+- 必须保留各文件中原有的自由备注段落，禁止整文件覆盖。
 
 ## 输出结构
 
@@ -53,7 +50,7 @@ output_contract: memory_update_plan_v1
   "proposed_changes": [
     {
       "file": "memory/portfolio.md",
-      "operation": "add_row|update_row|append_note|no_change",
+      "operation": "add_row|update_row|replace_section|no_change",
       "reason": "为什么改",
       "details": "具体改什么"
     }
@@ -75,6 +72,5 @@ output_contract: memory_update_plan_v1
 
 ## 输出要求
 
-- 不直接输出“已修改”，只能输出修改计划；真实写文件由后续确定性代码执行。
-- 含糊更新不能猜。
-- 不能把市场临时观点写入长期记忆。
+- 计划经用户确认后，由助手通过编辑工具写入 Markdown；**不存在**单独的 Python 自动写回协议。
+- 含糊更新不能猜；不能把市场临时观点写入长期记忆。

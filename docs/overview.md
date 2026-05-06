@@ -22,30 +22,27 @@ Current files:
 - `docs/overview.md`: this developer entry document.
 - `docs/trading-agent-plan.md`: the staged implementation contract for the trading decision agent. Later `continue`, `继续`, or `执行 Phase X` work should read this plan first.
 - `src/trading_agent/__init__.py`: package marker and version.
-- `src/trading_agent/cli.py`: CLI command routing and Phase 5 Agent packet assembly for judgment commands, memory updates, quote calls, setup questions, and portfolio preflight.
+- `src/trading_agent/cli.py`: CLI routing, Markdown memory **read** + **持仓表**解析（用于预检）、Agent packet / JSON 格式化、行情调用与 skill 执行包组装；记忆文件的**写入**由模型按 `skills/memory_update.md` 在编辑器中完成。
 - `src/trading_agent/models.py`: core data contracts for markets, symbols, quote snapshots, holdings, evidence, rule matches, and rating results.
 - `src/trading_agent/market_data.py`: simplified market-data fetching and normalization. It currently uses Tencent quote/kline endpoints for A-shares and Yahoo chart for US stocks.
-- `src/trading_agent/memory.py`: safe helpers for the three planned memory files, including allowed-file checks, Markdown table parsing, dry-run diffs, table-row upsert, setup question generation, portfolio preflight, and simple buy/sell update detection.
 - `src/trading_agent/skills.py`: repo-local skill metadata parser, loader, validator, and execution-packet builder.
-- `src/trading_agent/report.py`: Agent packet and rating result formatting helpers.
 - `scripts/fetch_quotes.py`: executable repository-local quote script for simplified A-share and US quote lookup.
 - `skills/target_screening.md`: judging whether a target passes the user's selection rules.
 - `skills/buy_rating.md`: judging whether a target is buyable today under the user's prohibition rules and cash discipline.
 - `skills/sell_rating.md`: judging whether a holding should be sold, reduced, held, or watched.
 - `skills/next_day_plan.md`: producing scenario-based next-trading-day action plans.
 - `skills/memory_update.md`: converting explicit user updates into safe memory update plans.
-- `memory/user_profile.md`: durable user background and trading discipline.
-- `memory/portfolio.md`: current holdings table. Buy date, buy price, quantity, thesis, stop notes, and remarks live here instead of a separate transaction log.
+- `memory/portfolio.md`: 「用户与账户」+ 当前持仓表（symbol, market, name, quantity, buy_date, buy_price, lots, notes）。
 - `memory/watchlist.md`: selected targets, themes, priority, focus-pool status, thesis, invalidation conditions, and notes.
 - `tests/test_models.py`, `tests/test_cli.py`, `tests/test_boundaries.py`, `tests/test_market_data.py`, `tests/test_skills.py`, `tests/test_memory.py`, `tests/test_agent_preflight.py`, `tests/test_cli_routing.py`, `tests/test_report_packets.py`, `tests/test_docs.py`: standard-library `unittest` coverage for current contracts, market-data normalization, skill loading, memory helpers, Agent preflight, CLI routing, report packets, and documentation entry files.
 
 Planned directories after phased implementation:
 
-- `src/trading_agent/`: main Python package with a deliberately flat v1 layout: `cli.py`, `models.py`, `market_data.py`, `memory.py`, `skills.py`, and `report.py`.
+- `src/trading_agent/`: main Python package with a deliberately flat v1 layout: `cli.py`, `models.py`, `market_data.py`, and `skills.py`.
 - `scripts/`: deterministic executable scripts, starting with simplified A-share and US quote lookup.
 - `skills/`: repository-local Markdown skill definitions for target screening, buy rating, sell rating, next-day planning, and lightweight memory update discipline.
-- `memory/`: exactly three user-editable Markdown memory documents for user profile, current portfolio, and watchlist.
-- `tests/`: unit and fixture tests for quote normalization, memory parsing, skill loading, routing, and report packets.
+- `memory/`: user-editable Markdown for merged account+portfolio and watchlist.
+- `tests/`: unit and fixture tests for quote normalization, memory parsing, skill loading, routing, and agent packets.
 - `docs/`: execution plan, project overview, and later operational notes.
 
 ## Core Functional Modules And Key Chains
@@ -65,29 +62,29 @@ The core behavior is planned around these chains:
   - The report for a command such as `judge-target <symbol-or-name>` must include the rating plus rule-by-rule reasons and matching bonus items.
   - Current Phase 5 behavior generates prompt/evidence packets rather than executing an LLM directly.
   - Blank profile/watchlist context is now optional context, not a hard initialization gate.
-  - Explicit factual buy/sell/add/reduce/clear updates can be detected via `--user-note` or `update-memory`; analysis questions or planned-trade intents such as “能不能买/是否加仓/准备买入/要不要卖” should not be treated as memory updates.
+  - Factual memory updates are handled with `skills/memory_update.md` plus direct Markdown edits; `update-memory` CLI only assembles that skill packet.
   - `judge-buy` checks portfolio context without blocking normal empty-position buys. Explicit add-buy requests require an existing complete holding first.
-  - `judge-sell` and `plan-next-day` preflight portfolio completeness. If a holding lacks quantity plus buy date and buy price/cost, the Agent asks the user to fill those fields before analysis.
+  - `judge-sell` and `plan-next-day` preflight portfolio completeness. If a holding lacks quantity plus buy date and buy price, the Agent asks the user to fill those fields before analysis. For buy/sell sizing and portfolio plans, it also asks for total position ratio, cash ratio, target position weight, other holdings, and same-theme holdings when unknown.
 - Simplified quote retrieval:
   - `scripts/fetch_quotes.py` will provide a deterministic user-facing script.
   - `src/trading_agent/market_data.py` holds the initial provider calls, parsing, normalization, output formatting, and CLI helper for the script.
-  - Quote outputs focus on recent closing prices, recent percentage changes, turnover where available, current-day open/latest or close, current-day percentage change, rough intraday shape, limit-up/sealed-board related flags where available, source, timestamp, and missing fields.
+  - Quote outputs focus on recent closing prices, recent percentage changes, turnover where available, volume, volume ratio, current-day open/latest or close, current-day percentage change, A-share 10-minute intraday samples embedded in the current daily `recent_bars` item, limit-up/sealed-board related flags where available, source, timestamp, and missing fields.
   - The script should not analyze months of daily K-line behavior, chip distribution, or complex chart patterns. Those remain model-side analysis tasks.
-  - Current provider limitations are explicit: US turnover and limit-up/board fields are missing; A-share recent daily turnover and board-open status are not reliably available through the current lightweight endpoints.
+  - Current provider limitations are explicit: US turnover and limit-up/board fields are missing; A-share recent daily turnover uses the 10jqka daily endpoint when available and is marked missing when unavailable; A-share board status is estimated from high/latest price versus inferred limit-up percentage.
 - Skill execution:
   - `skills/*.md` will contain the user-specific trading rules and output schemas.
   - `src/trading_agent/skills.py` will load skill files, validate required inputs, and prepare execution packets.
   - Skills must separate deterministic quote evidence from model search, model chart/image analysis, assumptions, and missing evidence.
   - Judging skills must output rating, conclusion, `rule_matches`, `bonus_matches`, `vetoes`, `missing_evidence`, and action. This is now encoded in the skill files and checked by tests.
 - Memory storage:
-  - `memory/user_profile.md` will store durable background such as market, funds/risk preferences, cash-reserve rule, and trading discipline notes.
-  - `memory/portfolio.md` will store current holdings. Trade information such as buy date, buy price, quantity, thesis, stop notes, and remarks belongs in this table rather than a separate trading log.
+  - `memory/portfolio.md` stores the user/account table and current holdings. Stable position facts such as buy date, buy price, total quantity, lot-level buy details, and optional notes belong here.
+  - Current price, unrealized PnL, market theme, and temporary stop/take-profit judgments are not stored in memory; they are fetched or reasoned about fresh during analysis.
   - `memory/watchlist.md` will store selected targets, themes, priority, focus-pool status, thesis, and invalidation conditions.
   - No long-term `market_context.md` is planned for v1. Market themes, risk events, and rotations are queried fresh during each analysis.
-  - `src/trading_agent/memory.py` can parse the first Markdown table in each memory file and apply safe row upserts with a dry-run diff. It only replaces the table block and preserves surrounding notes.
+  - `cli.py` reads memory and parses the **持仓表** for setup questions and portfolio preflight; it does not persist user edits.
   - Agent orchestration treats portfolio buy information as required for sell judgments, next-day holding plans, and explicit add-buy judgments.
 - Report assembly:
-  - `src/trading_agent/report.py` will format structured outputs into practical trading checklists.
+  - `cli.py` formats structured agent packets for CLI/manual LLM use.
   - Reports should include rating enum, conclusion, hard-rule matches, bonus-item matches, veto triggers, script evidence, model evidence, missing data, action recommendation, and risk notes.
   - Current output is an LLM-ready packet containing optional setup/context questions, portfolio notices, blocking preflight issues, quote evidence, skill metadata, and the full skill prompt.
 
@@ -100,7 +97,7 @@ The core behavior is planned around these chains:
 - Do not add brokerage order execution in the initial version.
 - Do not add frontend work, page viewing, or playwright usage for this project unless the user explicitly changes that instruction.
 - Do not store market context or daily quote snapshots in v1. Query current market information at analysis time.
-- Do not create a separate transaction log in v1. Record buy date, buy price, quantity, thesis, and notes in the holdings table.
+- Do not create a separate transaction log in v1. Record buy date, average buy price/cost, quantity, lot-level buy details, and notes in the holdings table.
 - Do not log full portfolio values, private notes, or raw generated prompts by default.
 - If backtesting, daily refresh, scheduling, or automation is added later, treat it as a separate planned feature after the initial four functions are stable.
 - If quote endpoints become unstable, replace them inside `src/trading_agent/market_data.py` without changing the higher-level CLI contract.

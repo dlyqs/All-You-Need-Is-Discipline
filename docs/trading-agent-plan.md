@@ -16,7 +16,7 @@
   - 用户基础背景信息。
   - 当前持仓组合。
   - 观察池。
-- 有一个确定性行情脚本，用于帮大模型快速获取 A 股和美股单个或批量标的的近期基础行情和当日粗略走势。
+- 有一个确定性行情脚本，用于帮大模型快速获取 A 股和美股单个或批量标的的近期基础行情，并为 A 股提供当日 10 分钟级日内采样点。
 - 主 Agent 输出必须明确说明：评级结果、触发了哪些硬规则、符合哪些加分项、哪些证据来自脚本、哪些判断来自模型临时查询和推理。
 
 初版范围内：
@@ -112,7 +112,7 @@
 | --- | --- | --- | --- | --- | --- |
 | Phase 0 | 计划契约 | 创建并根据用户反馈简化阶段计划和项目概览 | completed | `docs/trading-agent-plan.md`、`docs/overview.md` | 未改实现代码 |
 | Phase 1 | 工程启动 | 创建项目骨架、包配置、CLI 壳、核心数据结构和扁平模块占位 | completed | `.gitignore`、`pyproject.toml`、`src/trading_agent/*.py`、`tests/*.py` | 仅骨架和占位边界；未实现交易判断 |
-| Phase 2 | 简化行情脚本 | 实现近期基础行情和当日粗略走势查询 | completed | `scripts/fetch_quotes.py`、`src/trading_agent/market_data.py`、`tests/test_market_data.py` | 使用腾讯 A 股接口和 Yahoo chart；脚本只提效，不做复杂图形判断 |
+| Phase 2 | 简化行情脚本 | 实现近期基础行情和 A 股当日日内采样查询 | completed | `scripts/fetch_quotes.py`、`src/trading_agent/market_data.py`、`tests/test_market_data.py` | 使用腾讯 A 股接口、东方财富 A 股分时和 Yahoo chart；脚本只提效，不做复杂图形判断 |
 | Phase 3 | Skill 库 | 创建判断标的、买入、卖出、次日方案和轻量记忆更新 skill | completed | `skills/*.md`、`src/trading_agent/skills.py`、`tests/test_skills.py` | 已实现 metadata 解析、加载校验、执行包生成；输出契约映射规则和加分项 |
 | Phase 4 | 轻量记忆存储 | 创建三份 Markdown 记忆文件和安全读写工具 | completed | `memory/user_profile.md`、`memory/portfolio.md`、`memory/watchlist.md`、`src/trading_agent/memory.py`、`tests/test_memory.py` | 不存市场上下文，不建独立交易日志 |
 | Phase 5 | 主 Agent 编排 | 实现命令路由、自然语言上下文检查、对话更新识别、脚本调用、skill 加载和报告组装 | completed | `src/trading_agent/cli.py`、`src/trading_agent/report.py`、`src/trading_agent/memory.py`、`tests/test_cli_routing.py`、`tests/test_report_packets.py`、`tests/test_agent_preflight.py` | 无 API key 时生成 prompt/evidence packet |
@@ -240,7 +240,7 @@
   - 当日换手率，数据源不支持时明确标记缺失。
   - 是否涨停或接近涨停，数据源不支持涨跌停价时用可解释的近似判断并标记。
   - 是否封板、是否封板后打开，只有在数据源能支持时才输出；否则标记缺失，不猜。
-  - 粗略走势标签，例如高开高走、一字板、低开高走、高开低走、震荡、弱势下跌等。标签必须基于可用的当日价格或分时数据，不能硬猜。
+  - A 股当日 10 分钟级日内采样点，作为模型判断高开、冲高回落、震荡、走弱等走势的事实数据；脚本不再输出机械形态标签。
 - 输出必须包含 source、timestamp、market、symbol、missing_fields。
 - 不分析几个月级别日线走势，不做复杂 K 线形态判断，不判断筹码峰。
 - 数据源失败时清晰报错，不能输出假数据。
@@ -273,11 +273,14 @@
   - `qt.gtimg.cn` 获取实时/当日基础信息。
   - `web.ifzq.gtimg.cn/appstock/app/fqkline/get` 获取近期日线基础信息。
 - 美股当前使用 Yahoo chart 接口获取近期日线和 regular market 基础信息。
-- 标准化输出包含：source、timestamp、market、symbol、name、latest/open/close/high/low/previous close、change pct、turnover rate、rough intraday shape、limit-up 近似标记、sealed-board 相关字段、recent bars、missing fields。
+- 标准化输出包含：source、timestamp、market、symbol、name、latest/open/close/high/low/previous close、change pct、turnover rate、volume、amount、volume ratio、limit-up 近似标记、sealed-board 相关字段、recent bars、missing fields；A 股当天的 `recent_bars` 对象会额外包含日内采样点。
+- A 股日内数据现在使用东方财富分钟分时降采样到约 10 分钟点位；脚本不再返回 `intraday_shape`，走势形态交给模型读取采样数据判断。
+- A 股近期日线优先使用同花顺公开日线接口获取逐日换手率；如果近期换手率取不到，标记缺失，不再用当前换手率按成交量比例估算。
+- A 股涨停、封板、开板回落通过推断涨停幅度后比较当日最高价和收盘/最新价估算。
 - 没有实现复杂 K 线分析、筹码峰分析、长期走势判断；这些仍按计划交给模型临时查询和看图分析。
 - 已明确标记数据源缺失：
   - 美股通常缺少换手率、涨停/封板字段。
-  - 当前 A 股近期日线缺少逐日换手率；封板和开板字段不可靠，因此标记缺失，不猜。
+  - A 股近期日线换手率来自同花顺日线接口；封板和开板字段不可靠，因此标记缺失，不猜。
 - 已运行验证：
   - `python -m unittest discover -s tests`，14 个测试通过。
   - `python -m trading_agent.market_data --help`
@@ -567,7 +570,7 @@
   - `tests/test_cli_routing.py`
   - `tests/test_report_packets.py`
 - 已运行验证：
-  - `python -m unittest discover -s tests`，46 个测试通过。
+  - `python -m unittest discover -s tests`，49 个测试通过。
   - `python -m trading_agent.cli judge-target NVDA --market US --skip-quotes --format json`
   - `python -m trading_agent.cli judge-sell NVDA --market US --skip-quotes --format text`
   - `python -m trading_agent.cli update-memory '我买了 NVDA' --format json`
@@ -634,7 +637,7 @@
   - 给出模块测试清单。
 - 新增 `tests/test_docs.py`，验证 AI 工具入口文件存在、README 包含 AI 工具使用和测试说明。
 - 已运行完整测试：
-  - `python -m unittest discover -s tests`，46 个测试通过。
+  - `python -m unittest discover -s tests`，49 个测试通过。
 - 已运行 smoke checks：
   - `python -m trading_agent.cli fetch-quotes NVDA --market US --format table`
   - `python -m trading_agent.cli judge-target NVDA --market US --skip-quotes --format json`

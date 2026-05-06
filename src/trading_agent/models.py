@@ -73,13 +73,38 @@ class Symbol:
 
 
 @dataclass(frozen=True)
+class IntradayQuotePoint:
+    """One sampled intraday point for model-side chart reading."""
+
+    timestamp: str
+    price: float | None = None
+    change_pct: float | None = None
+    average_price: float | None = None
+    volume: float | None = None
+    amount: float | None = None
+
+
+@dataclass(frozen=True)
 class RecentQuoteBar:
     """One recent daily quote row used by the simplified market data script."""
 
     trade_date: str
+    open: float | None = None
     close: float | None = None
+    high: float | None = None
+    low: float | None = None
+    previous_close: float | None = None
     change_pct: float | None = None
     turnover_rate: float | None = None
+    volume: float | None = None
+    amount: float | None = None
+    volume_ratio: float | None = None
+    is_limit_up: bool | None = None
+    is_sealed_board: bool | None = None
+    opened_after_seal: bool | None = None
+    intraday_sample_interval_minutes: int | None = None
+    intraday_source: str | None = None
+    intraday_samples: list[IntradayQuotePoint] | None = None
 
 
 @dataclass(frozen=True)
@@ -97,7 +122,9 @@ class QuoteSnapshot:
     previous_close: float | None = None
     change_pct: float | None = None
     turnover_rate: float | None = None
-    intraday_shape: str | None = None
+    volume: float | None = None
+    amount: float | None = None
+    volume_ratio: float | None = None
     is_limit_up: bool | None = None
     is_sealed_board: bool | None = None
     opened_after_seal: bool | None = None
@@ -114,10 +141,7 @@ class Holding:
     buy_date: str | None = None
     buy_price: float | None = None
     cost: float | None = None
-    current_price: float | None = None
-    theme: str | None = None
-    thesis: str | None = None
-    stop_notes: str | None = None
+    lots: str | None = None
     notes: str | None = None
 
 

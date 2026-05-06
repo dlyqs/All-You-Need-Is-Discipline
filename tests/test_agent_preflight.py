@@ -1,21 +1,47 @@
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import shutil
 import unittest
+from unittest.mock import patch
 
-from trading_agent.cli import build_agent_packet
-from trading_agent.memory import upsert_memory_table_row
+from trading_agent.cli import build_agent_packet, quote_cache_path
+from trading_agent.models import Market, QuoteSnapshot, Symbol
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
+_MIN_ACCOUNT = """# x
+## 用户与账户
+| 字段 | 值 | 备注 |
+| --- | --- | --- |
+| 主要交易市场 | A股 | x |
 
-def copy_project_memory(tmp_root):
-    shutil.copytree(PROJECT_ROOT / "memory", tmp_root / "memory")
-    shutil.copytree(PROJECT_ROOT / "skills", tmp_root / "skills")
+## 持仓表
+| symbol | market | name | quantity | buy_date | buy_price | lots | notes |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+"""
+
+
+def _empty_holdings_portfolio() -> str:
+    return _MIN_ACCOUNT + "\n## 自由备注\n"
+
+
+def _copy_skills_watchlist(root: Path) -> None:
+    (root / "memory").mkdir(parents=True, exist_ok=True)
+    shutil.copytree(PROJECT_ROOT / "skills", root / "skills", dirs_exist_ok=True)
+    (root / "memory" / "watchlist.md").write_text(
+        (PROJECT_ROOT / "memory" / "watchlist.md").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
 
 
 class AgentPreflightTest(unittest.TestCase):
+    def tearDown(self):
+        cache_path = quote_cache_path(PROJECT_ROOT)
+        if cache_path.exists():
+            cache_path.unlink()
+
     def test_judge_target_does_not_block_on_blank_memory(self):
         packet = build_agent_packet(
             project_root=PROJECT_ROOT,
@@ -29,13 +55,18 @@ class AgentPreflightTest(unittest.TestCase):
         self.assertEqual(packet["setup_questions"], [])
 
     def test_judge_buy_empty_portfolio_is_non_blocking(self):
-        packet = build_agent_packet(
-            project_root=PROJECT_ROOT,
-            command="judge-buy",
-            symbol_or_name="NVDA",
-            market="US",
-            skip_quotes=True,
-        )
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _copy_skills_watchlist(root)
+            (root / "memory" / "portfolio.md").write_text(_empty_holdings_portfolio(), encoding="utf-8")
+
+            packet = build_agent_packet(
+                project_root=root,
+                command="judge-buy",
+                symbol_or_name="NVDA",
+                market="US",
+                skip_quotes=True,
+            )
 
         self.assertEqual(packet["status"], "ready")
         self.assertEqual(packet["preflight_issues"], [])
@@ -53,7 +84,6 @@ class AgentPreflightTest(unittest.TestCase):
 
         self.assertEqual(packet["status"], "needs_portfolio_info")
         self.assertEqual(packet["preflight_issues"][0]["missing_fields"], ["portfolio_holding"])
-        self.assertEqual(packet["memory_update"]["status"], "no_update_detected")
         self.assertEqual(packet["setup_questions"], [])
 
     def test_judge_sell_blocks_when_holding_missing(self):
@@ -72,14 +102,12 @@ class AgentPreflightTest(unittest.TestCase):
     def test_judge_sell_blocks_when_buy_info_incomplete(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
-            copy_project_memory(root)
-            upsert_memory_table_row(
-                root,
-                "portfolio.md",
-                "symbol",
-                {"symbol": "NVDA", "market": "US", "name": "NVIDIA", "quantity": "10"},
-                dry_run=False,
+            _copy_skills_watchlist(root)
+            body = (
+                _MIN_ACCOUNT
+                + "| NVDA | US | NVIDIA | 10 |  |  |  |\n\n## 自由备注\n"
             )
+            (root / "memory" / "portfolio.md").write_text(body, encoding="utf-8")
 
             packet = build_agent_packet(
                 project_root=root,
@@ -91,7 +119,7 @@ class AgentPreflightTest(unittest.TestCase):
 
             self.assertEqual(packet["status"], "needs_portfolio_info")
             self.assertIn("buy_date", packet["preflight_issues"][0]["missing_fields"])
-            self.assertIn("buy_price_or_cost", packet["preflight_issues"][0]["missing_fields"])
+            self.assertIn("buy_price", packet["preflight_issues"][0]["missing_fields"])
 
     def test_plan_next_day_allows_confirmed_empty_portfolio(self):
         packet = build_agent_packet(
@@ -105,7 +133,7 @@ class AgentPreflightTest(unittest.TestCase):
         areas = [item["area"] for item in packet["setup_questions"]]
         self.assertNotIn("portfolio", areas)
 
-    def test_detected_buy_update_needs_confirmation_when_incomplete(self):
+    def test_user_note_does_not_trigger_memory_confirmation(self):
         packet = build_agent_packet(
             project_root=PROJECT_ROOT,
             command="judge-target",
@@ -114,32 +142,34 @@ class AgentPreflightTest(unittest.TestCase):
             skip_quotes=True,
         )
 
-        self.assertEqual(packet["status"], "needs_memory_confirmation")
-        self.assertEqual(packet["memory_update"]["action"], "buy")
-        self.assertIn("quantity", packet["memory_update"]["missing_fields"])
-        self.assertEqual(packet["setup_questions"], [])
+        self.assertEqual(packet["status"], "ready")
 
-    def test_complete_buy_update_can_apply_before_packet(self):
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            copy_project_memory(root)
+    def test_quote_evidence_uses_single_symbol_cache(self):
+        snapshot = QuoteSnapshot(
+            symbol=Symbol(value="NVDA", market=Market.US, name="NVIDIA"),
+            source="fixture",
+            timestamp=datetime(2026, 5, 6, tzinfo=timezone.utc),
+            latest_price=100.0,
+        )
 
-            packet = build_agent_packet(
-                project_root=root,
+        with patch("trading_agent.cli.fetch_quotes", return_value=[snapshot]) as fetch_quotes_mock:
+            first = build_agent_packet(
+                project_root=PROJECT_ROOT,
                 command="judge-target",
                 symbol_or_name="NVDA",
                 market="US",
-                user_note=(
-                    "action=buy symbol=NVDA market=US name=NVIDIA quantity=10 "
-                    "buy_date=2026-05-06 buy_price=196.5 thesis=AI"
-                ),
-                apply_memory_updates=True,
-                skip_quotes=True,
+            )
+            second = build_agent_packet(
+                project_root=PROJECT_ROOT,
+                command="judge-target",
+                symbol_or_name="NVDA",
+                market="US",
             )
 
-            self.assertIn(packet["memory_update"]["status"], ("applied",))
-            text = (root / "memory" / "portfolio.md").read_text(encoding="utf-8")
-            self.assertIn("| NVDA | US | NVIDIA | 10 | 2026-05-06 | 196.5", text)
+        self.assertEqual(first["status"], "ready")
+        self.assertEqual(second["status"], "ready")
+        self.assertEqual(fetch_quotes_mock.call_count, 1)
+        self.assertEqual(first["quote_snapshots"], second["quote_snapshots"])
 
 
 if __name__ == "__main__":

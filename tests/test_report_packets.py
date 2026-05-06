@@ -1,7 +1,7 @@
 import json
 import unittest
 
-from trading_agent.report import format_agent_packet, packet_to_json
+from trading_agent.cli import format_agent_packet, packet_to_json
 
 
 class ReportPacketTest(unittest.TestCase):
@@ -15,9 +15,7 @@ class ReportPacketTest(unittest.TestCase):
                 {
                     "symbol": "NVDA",
                     "market": "US",
-                    "latest_price": 100.0,
-                    "change_pct": 1.2,
-                    "intraday_shape": "走强",
+                    "recent_bars": [{"trade_date": "2026-05-06", "close": 100.0, "change_pct": 1.2}],
                     "missing_fields": ["turnover_rate"],
                 }
             ],
@@ -34,6 +32,7 @@ class ReportPacketTest(unittest.TestCase):
         self.assertIn("# Trading Agent Packet", text)
         self.assertIn("补充背景", text)
         self.assertIn("NVDA US latest=100.0", text)
+        self.assertIn("intraday_points=0", text)
         self.assertIn("```markdown", text)
 
     def test_packet_to_json_keeps_chinese(self):

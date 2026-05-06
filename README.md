@@ -27,12 +27,11 @@ The AI tool should read `AGENTS.md`, inspect memory, call the internal CLI, and 
 
 ## What Exists Now
 
-- `memory/user_profile.md`: user background, market, funds, risk style, cash discipline.
-- `memory/portfolio.md`: current holdings. Buy date, buy price, quantity, thesis, stop notes, and transaction remarks live here.
+- `memory/portfolio.md`: 「用户与账户」+ 当前持仓表。列：`symbol`, `market`, `name`, `quantity`, `buy_date`, `buy_price`, `lots`, `notes`（仅在有说明时填写）。不长期存现价、浮盈浮亏、题材、临时的止损止盈判断。
 - `memory/watchlist.md`: watchlist targets and invalidation logic.
 - `skills/*.md`: judgment rules for target screening, buy rating, sell rating, next-day planning, and memory updates.
 - `scripts/fetch_quotes.py`: simplified A-share and US quote lookup.
-- `src/trading_agent/`: lightweight Python package for CLI routing, quote data, memory helpers, skill loading, and packet formatting.
+- `src/trading_agent/`: Python package with `cli.py` (memory read + preflight + packet formatting), `market_data.py`, `models.py`, and `skills.py`.
 
 ## First-Time Setup
 
@@ -54,23 +53,29 @@ Minimum useful user profile:
 最低现金保留规则：至少 30% 现金
 ```
 
-Minimum useful holding row:
+Minimum useful holding row (持仓表):
 
 ```text
-symbol, market, name, quantity, buy_date, buy_price, cost/current_price, theme, thesis
+symbol, market, name, quantity, buy_date, buy_price, lots, notes(optional)
 ```
 
-Buy judgments can run with an empty portfolio because they may be new-position buys. Add-buy judgments, sell judgments, and next-day plans require complete holding information. If buy date, buy price/cost, quantity, or thesis is missing, the agent should ask you to fill it before analysis.
+For multiple buys, summarize the current position and keep lot details in `lots`, for example:
+
+```text
+2026-04-24:100@88.1; 2026-04-28:100@88.76
+```
+
+Buy judgments can run with an empty portfolio because they may be new-position buys. Add-buy judgments, sell judgments, and next-day plans require complete holding information. If buy date, buy price, or quantity is missing, the agent should ask you to fill it before analysis. For buy/sell sizing, the agent should also ask for total position ratio, cash ratio, target position weight, other holdings, and same-theme holdings when those are unknown.
 
 ## Natural-Language Use
 
 After opening the project in Codex, Cursor, or Claude Code, speak normally:
 
 ```text
-我买了 NVDA，market=US，quantity=10，buy_date=2026-05-06，buy_price=196.5，thesis=AI 算力核心。
+我买了 NVDA，market=US，quantity=10，buy_date=2026-05-06，buy_price=196.5，notes=AI 算力核心。
 ```
 
-The agent should detect this as a memory update and update `memory/portfolio.md` if fields are complete.
+The agent should treat this as a factual memory update: follow `skills/memory_update.md` and edit `memory/portfolio.md` / `memory/watchlist.md` when fields are clear; otherwise ask for missing fields only.
 
 Examples:
 
@@ -119,16 +124,10 @@ python -m trading_agent.cli judge-sell NVDA --market US --format text
 python -m trading_agent.cli plan-next-day --allow-empty-portfolio --format text
 ```
 
-Dry-run a memory update:
+Assemble the memory-update skill packet (you still edit Markdown yourself):
 
 ```bash
-python -m trading_agent.cli update-memory 'action=buy symbol=NVDA market=US name=NVIDIA quantity=10 buy_date=2026-05-06 buy_price=196.5 thesis=AI'
-```
-
-Apply a complete memory update:
-
-```bash
-python -m trading_agent.cli update-memory 'action=buy symbol=NVDA market=US name=NVIDIA quantity=10 buy_date=2026-05-06 buy_price=196.5 thesis=AI' --apply
+python -m trading_agent.cli update-memory '我买了 NVDA market=US quantity=10 buy_date=2026-05-06 buy_price=196.5' --format json
 ```
 
 Save a packet for another AI tool:
@@ -148,7 +147,7 @@ from trading_agent.skills import load_all_skills
 for command, skill in load_all_skills(Path.cwd()).items():
     print(command, skill.metadata.skill_id, skill.metadata.output_contract)
 PY`
-- Memory dry-run:
+- Memory update skill packet:
   `python -m trading_agent.cli update-memory '我买了 NVDA' --format json`
 - Agent packet:
   `python -m trading_agent.cli judge-target NVDA --market US --skip-quotes --format json`
@@ -161,8 +160,9 @@ PY`
 
 - The system does not place trades.
 - The CLI generates prompt/evidence packets; the AI tool performs the final reasoning.
-- A-share quotes currently use Tencent lightweight endpoints.
+- A-share quotes currently use Tencent quote/K-line endpoints plus Eastmoney intraday minutes when available.
 - US quotes currently use Yahoo chart.
 - US turnover and limit-up/board fields are usually missing.
-- Current A-share lightweight endpoints do not reliably provide sealed-board/opened-board fields.
+- A-share recent-bar turnover uses the 10jqka daily endpoint when available; if it is unavailable, historical turnover is omitted instead of estimated.
+- A-share sealed-board/opened-board flags are estimated from high/latest price versus inferred limit-up percentage.
 - Long-term K-line interpretation, chip distribution, and market theme analysis are model-side tasks.

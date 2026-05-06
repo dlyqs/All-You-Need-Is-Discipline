@@ -20,10 +20,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Sequence
 
-from trading_agent.models import Market, QuoteSnapshot, RecentQuoteBar, Symbol
+from trading_agent.models import IntradayQuotePoint, Market, QuoteSnapshot, RecentQuoteBar, Symbol
 
 
 DEFAULT_RECENT_DAYS = 5
+DEFAULT_INTRADAY_SAMPLE_INTERVAL_MINUTES = 10
 USER_AGENT = "Mozilla/5.0 (compatible; trading-agent/0.1)"
 CHINA_TZ = timezone(timedelta(hours=8))
 
@@ -36,6 +37,18 @@ class MarketDataError(RuntimeError):
 class QuoteRequest:
     symbols: list[Symbol]
     recent_days: int = DEFAULT_RECENT_DAYS
+
+
+@dataclass(frozen=True)
+class IntradayBar:
+    timestamp: str
+    open: float | None = None
+    close: float | None = None
+    high: float | None = None
+    low: float | None = None
+    volume: float | None = None
+    amount: float | None = None
+    average_price: float | None = None
 
 
 def build_quote_request(
@@ -103,12 +116,28 @@ def fetch_a_share_quote(
     quote_text = http_text(f"https://qt.gtimg.cn/q={sec_prefix}{code}", timeout=timeout, encoding="gbk")
     quote_data = parse_tencent_quote_text(quote_text)
 
-    kline_url = (
-        "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?"
-        + urllib.parse.urlencode({"param": f"{sec_prefix}{code},day,,,{recent_days},qfq"})
+    recent_source = "10jqka_kline"
+    try:
+        recent_bars = fetch_10jqka_recent_bars(code, recent_days=recent_days, timeout=timeout)
+    except MarketDataError:
+        recent_source = "tencent_kline"
+        kline_url = (
+            "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?"
+            + urllib.parse.urlencode({"param": f"{sec_prefix}{code},day,,,{recent_days},qfq"})
+        )
+        kline_payload = http_json(kline_url, timeout=timeout)
+        recent_bars = parse_tencent_kline_payload(kline_payload, f"{sec_prefix}{code}")
+    intraday_bars: list[IntradayBar] = []
+    intraday_error = False
+    try:
+        intraday_bars = fetch_eastmoney_intraday_bars(code, timeout=timeout)
+    except MarketDataError:
+        intraday_error = True
+    intraday_samples = build_intraday_samples(
+        intraday_bars,
+        previous_close=to_float(quote_data.get("previous_close")),
+        interval_minutes=DEFAULT_INTRADAY_SAMPLE_INTERVAL_MINUTES,
     )
-    kline_payload = http_json(kline_url, timeout=timeout)
-    recent_bars = parse_tencent_kline_payload(kline_payload, f"{sec_prefix}{code}")
 
     now = parse_tencent_timestamp(quote_data.get("timestamp")) or datetime.now(timezone.utc)
     latest_price = to_float(quote_data.get("latest_price"))
@@ -119,10 +148,13 @@ def fetch_a_share_quote(
     high_price = to_float(quote_data.get("high_price"))
     low_price = to_float(quote_data.get("low_price"))
     turnover_rate = to_float(quote_data.get("turnover_rate"))
+    volume = to_float(quote_data.get("volume"))
+    amount = to_float(quote_data.get("amount"))
+    volume_ratio = to_float(quote_data.get("volume_ratio"))
     missing_fields = []
 
     if recent_bars:
-        recent_bars = attach_recent_change_pct(recent_bars)[-recent_days:]
+        recent_bars = attach_recent_metrics(recent_bars)[-recent_days:]
         recent_missing = any(bar.turnover_rate is None for bar in recent_bars)
         if recent_missing:
             missing_fields.append("recent_turnover_rate")
@@ -135,23 +167,53 @@ def fetch_a_share_quote(
         "previous_close": previous_close,
         "change_pct": change_pct,
         "turnover_rate": turnover_rate,
+        "volume": volume,
     }
     missing_fields.extend([key for key, value in fields.items() if value is None])
-    missing_fields.extend(["is_sealed_board", "opened_after_seal"])
+    if amount is None:
+        missing_fields.append("amount")
+    if volume_ratio is None:
+        missing_fields.append("volume_ratio")
+    if intraday_error or not intraday_samples:
+        missing_fields.append("intraday_samples")
 
-    is_limit_up = estimate_a_share_limit_up(change_pct)
-    intraday_shape = classify_intraday_shape(
-        open_price=open_price,
+    limit_pct = a_share_limit_pct(code, quote_data.get("name") or symbol.name)
+    is_limit_up = estimate_a_share_limit_up(
+        high_price=high_price,
+        previous_close=previous_close,
+        limit_pct=limit_pct,
+    )
+    is_sealed_board = estimate_a_share_sealed_board(
         latest_price=latest_price,
         previous_close=previous_close,
+        limit_pct=limit_pct,
+        is_limit_up=is_limit_up,
+    )
+    opened_after_seal = is_limit_up and is_sealed_board is False
+
+    recent_bars = attach_current_day_details(
+        recent_bars,
+        trade_date=now.astimezone(CHINA_TZ).date().isoformat(),
+        open_price=open_price,
+        latest_price=latest_price,
         high_price=high_price,
         low_price=low_price,
+        previous_close=previous_close,
+        change_pct=change_pct,
+        turnover_rate=turnover_rate,
+        volume=volume,
+        amount=amount,
+        volume_ratio=volume_ratio,
         is_limit_up=is_limit_up,
+        is_sealed_board=is_sealed_board,
+        opened_after_seal=opened_after_seal,
+        intraday_samples=intraday_samples,
+        recent_days=recent_days,
     )
 
     return QuoteSnapshot(
         symbol=Symbol(value=code, market=Market.A, name=quote_data.get("name") or symbol.name),
-        source="tencent_quote+tencent_kline",
+        source=f"tencent_quote+{recent_source}+eastmoney_intraday" if intraday_bars else f"tencent_quote+{recent_source}",
         timestamp=now,
         latest_price=latest_price,
         open_price=open_price,
@@ -161,10 +223,12 @@ def fetch_a_share_quote(
         previous_close=previous_close,
         change_pct=change_pct,
         turnover_rate=turnover_rate,
-        intraday_shape=intraday_shape,
+        volume=volume,
+        amount=amount,
+        volume_ratio=volume_ratio,
         is_limit_up=is_limit_up,
-        is_sealed_board=None,
-        opened_after_seal=None,
+        is_sealed_board=is_sealed_board,
+        opened_after_seal=opened_after_seal,
         recent_bars=recent_bars,
         missing_fields=sorted(set(missing_fields)),
     )
@@ -196,6 +260,7 @@ def fetch_us_quote(
     last_close = last_number(quote_rows.get("close"))
     last_high = last_number(quote_rows.get("high"))
     last_low = last_number(quote_rows.get("low"))
+    last_volume = last_number(quote_rows.get("volume"))
     if latest_price is None:
         latest_price = last_close
 
@@ -211,7 +276,13 @@ def fetch_us_quote(
         missing_fields.append("latest_price")
     if previous_close is None:
         missing_fields.append("previous_close")
-    missing_fields.extend(["turnover_rate", "recent_turnover_rate", "is_limit_up", "is_sealed_board", "opened_after_seal"])
+    if last_volume is None:
+        missing_fields.append("volume")
+    missing_fields.extend(["turnover_rate", "recent_turnover_rate", "amount", "is_limit_up", "is_sealed_board", "opened_after_seal"])
+    recent_bars = attach_recent_metrics(recent_bars)[-recent_days:]
+    latest_volume_ratio = recent_bars[-1].volume_ratio if recent_bars else None
+    if latest_volume_ratio is None:
+        missing_fields.append("volume_ratio")
 
     return QuoteSnapshot(
         symbol=Symbol(
@@ -229,18 +300,13 @@ def fetch_us_quote(
         previous_close=previous_close,
         change_pct=change_pct,
         turnover_rate=None,
-        intraday_shape=classify_intraday_shape(
-            open_price=last_open,
-            latest_price=latest_price,
-            previous_close=previous_close,
-            high_price=last_high,
-            low_price=last_low,
-            is_limit_up=None,
-        ),
+        volume=last_volume,
+        amount=None,
+        volume_ratio=latest_volume_ratio,
         is_limit_up=None,
         is_sealed_board=None,
         opened_after_seal=None,
-        recent_bars=attach_recent_change_pct(recent_bars)[-recent_days:],
+        recent_bars=recent_bars,
         missing_fields=sorted(set(missing_fields)),
     )
 
@@ -258,8 +324,16 @@ def http_json(url: str, timeout: float) -> dict[str, Any]:
         raise MarketDataError(f"Provider returned non-JSON response: {url}") from exc
 
 
-def http_text(url: str, timeout: float, encoding: str = "utf-8") -> str:
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+def http_text(
+    url: str,
+    timeout: float,
+    encoding: str = "utf-8",
+    headers: dict[str, str] | None = None,
+) -> str:
+    request_headers = {"User-Agent": USER_AGENT}
+    if headers:
+        request_headers.update(headers)
+    request = urllib.request.Request(url, headers=request_headers)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return response.read().decode(encoding, errors="replace")
@@ -275,6 +349,48 @@ def tencent_a_share_prefix(code: str) -> str:
     if code.startswith(("0", "1", "2", "3")):
         return "sz"
     raise MarketDataError(f"Cannot infer A-share exchange prefix for: {code}")
+
+
+def eastmoney_a_share_secid(code: str) -> str:
+    if not (code.isdigit() and len(code) == 6):
+        raise MarketDataError(f"A-share symbol must be a 6-digit code: {code}")
+    market_id = "1" if code.startswith(("5", "6", "9")) else "0"
+    return f"{market_id}.{code}"
+
+
+def fetch_eastmoney_intraday_bars(code: str, timeout: float) -> list[IntradayBar]:
+    url = (
+        "https://push2.eastmoney.com/api/qt/stock/trends2/get?"
+        + urllib.parse.urlencode(
+            {
+                "secid": eastmoney_a_share_secid(code),
+                "fields1": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13",
+                "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
+                "ndays": "1",
+                "iscr": "0",
+                "iscca": "0",
+            }
+        )
+    )
+    payload = http_json(url, timeout=timeout)
+    data = payload.get("data") or {}
+    rows = data.get("trends") or []
+    if not rows:
+        raise MarketDataError(f"Eastmoney intraday returned no rows for {code}")
+    return parse_eastmoney_intraday_rows(rows)
+
+
+def fetch_10jqka_recent_bars(code: str, recent_days: int, timeout: float) -> list[RecentQuoteBar]:
+    url = f"https://d.10jqka.com.cn/v6/line/hs_{code}/01/last.js"
+    text = http_text(
+        url,
+        timeout=timeout,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Referer": f"https://stockpage.10jqka.com.cn/{code}/",
+        },
+    )
+    return parse_10jqka_kline_text(text)[-recent_days:]
 
 
 def parse_tencent_quote_text(text: str) -> dict[str, str]:
@@ -295,8 +411,18 @@ def parse_tencent_quote_text(text: str) -> dict[str, str]:
         "change_pct": parts[32],
         "high_price": parts[33],
         "low_price": parts[34],
+        "volume": parts[36],
+        "amount": parse_tencent_amount(parts[35], parts[37] if len(parts) > 37 else ""),
         "turnover_rate": parts[38],
+        "volume_ratio": parts[49] if len(parts) > 49 else "",
     }
+
+
+def parse_tencent_amount(combined: str, fallback: str) -> str:
+    parts = combined.split("/")
+    if len(parts) >= 3 and parts[2]:
+        return parts[2]
+    return fallback
 
 
 def parse_tencent_kline_payload(payload: dict[str, Any], key: str) -> list[RecentQuoteBar]:
@@ -310,12 +436,181 @@ def parse_tencent_kline_payload(payload: dict[str, Any], key: str) -> list[Recen
         bars.append(
             RecentQuoteBar(
                 trade_date=str(row[0]),
+                open=to_float(row[1]) if len(row) > 1 else None,
                 close=to_float(row[2]),
+                high=to_float(row[3]) if len(row) > 3 else None,
+                low=to_float(row[4]) if len(row) > 4 else None,
                 change_pct=None,
                 turnover_rate=None,
+                volume=to_float(row[5]) if len(row) > 5 else None,
             )
         )
     return bars
+
+
+def parse_10jqka_kline_text(text: str) -> list[RecentQuoteBar]:
+    start = text.find("({")
+    end = text.rfind("})")
+    if start == -1 or end == -1:
+        raise MarketDataError("10jqka kline response has unexpected shape")
+    try:
+        payload = json.loads(text[start + 1 : end + 1])
+    except json.JSONDecodeError as exc:
+        raise MarketDataError("10jqka kline response is not valid JSONP") from exc
+    rows = str(payload.get("data") or "").split(";")
+    bars = []
+    for row in rows:
+        if not row:
+            continue
+        parts = row.split(",")
+        if len(parts) < 8:
+            continue
+        trade_date = parse_compact_trade_date(parts[0])
+        if trade_date is None:
+            continue
+        volume_shares = to_float(parts[5])
+        bars.append(
+            RecentQuoteBar(
+                trade_date=trade_date,
+                open=to_float(parts[1]),
+                high=to_float(parts[2]),
+                low=to_float(parts[3]),
+                close=to_float(parts[4]),
+                volume=round(volume_shares / 100, 4) if volume_shares is not None else None,
+                amount=to_float(parts[6]),
+                turnover_rate=to_float(parts[7]),
+            )
+        )
+    if not bars:
+        raise MarketDataError("10jqka kline returned no usable rows")
+    return bars
+
+
+def parse_compact_trade_date(value: str) -> str | None:
+    try:
+        return datetime.strptime(value, "%Y%m%d").date().isoformat()
+    except ValueError:
+        return None
+
+
+def parse_eastmoney_intraday_rows(rows: Iterable[str]) -> list[IntradayBar]:
+    bars = []
+    for row in rows:
+        parts = str(row).split(",")
+        if len(parts) < 7:
+            continue
+        bars.append(
+            IntradayBar(
+                timestamp=parts[0],
+                open=to_float(parts[1]),
+                close=to_float(parts[2]),
+                high=to_float(parts[3]),
+                low=to_float(parts[4]),
+                volume=to_float(parts[5]),
+                amount=to_float(parts[6]),
+                average_price=to_float(parts[7]) if len(parts) > 7 else None,
+            )
+        )
+    return bars
+
+
+def build_intraday_samples(
+    bars: list[IntradayBar],
+    *,
+    previous_close: float | None,
+    interval_minutes: int = DEFAULT_INTRADAY_SAMPLE_INTERVAL_MINUTES,
+) -> list[IntradayQuotePoint]:
+    sampled = sample_intraday_bars(bars, interval_minutes=interval_minutes)
+    points = []
+    for bar in sampled:
+        price = bar.close
+        points.append(
+            IntradayQuotePoint(
+                timestamp=bar.timestamp,
+                price=price,
+                change_pct=pct_change(price, previous_close),
+                average_price=bar.average_price,
+                volume=bar.volume,
+                amount=bar.amount,
+            )
+        )
+    return points
+
+
+def sample_intraday_bars(
+    bars: list[IntradayBar],
+    *,
+    interval_minutes: int = DEFAULT_INTRADAY_SAMPLE_INTERVAL_MINUTES,
+) -> list[IntradayBar]:
+    if interval_minutes <= 0:
+        raise ValueError("interval_minutes must be positive")
+    ordered = sorted(bars, key=lambda bar: parse_intraday_timestamp(bar.timestamp) or datetime.max.replace(tzinfo=CHINA_TZ))
+    sampled: list[IntradayBar] = []
+    last_sample_time: datetime | None = None
+    for bar in ordered:
+        bar_time = parse_intraday_timestamp(bar.timestamp)
+        if bar_time is None:
+            continue
+        if last_sample_time is None or bar_time - last_sample_time >= timedelta(minutes=interval_minutes):
+            sampled.append(bar)
+            last_sample_time = bar_time
+    if ordered and (not sampled or sampled[-1].timestamp != ordered[-1].timestamp):
+        sampled.append(ordered[-1])
+    return sampled
+
+
+def parse_intraday_timestamp(value: str) -> datetime | None:
+    try:
+        return datetime.strptime(value, "%Y-%m-%d %H:%M").replace(tzinfo=CHINA_TZ)
+    except ValueError:
+        return None
+
+
+def attach_current_day_details(
+    bars: list[RecentQuoteBar],
+    *,
+    trade_date: str,
+    open_price: float | None,
+    latest_price: float | None,
+    high_price: float | None,
+    low_price: float | None,
+    previous_close: float | None,
+    change_pct: float | None,
+    turnover_rate: float | None,
+    volume: float | None,
+    amount: float | None,
+    volume_ratio: float | None,
+    is_limit_up: bool | None,
+    is_sealed_board: bool | None,
+    opened_after_seal: bool | None,
+    intraday_samples: list[IntradayQuotePoint],
+    recent_days: int,
+) -> list[RecentQuoteBar]:
+    existing_current = next((bar for bar in bars if bar.trade_date == trade_date), None)
+    current_close = latest_price if latest_price is not None else (existing_current.close if existing_current else None)
+    current_change_pct = change_pct if change_pct is not None else pct_change(current_close, previous_close)
+    current_bar = RecentQuoteBar(
+        trade_date=trade_date,
+        open=open_price,
+        close=current_close,
+        high=high_price,
+        low=low_price,
+        previous_close=previous_close,
+        change_pct=current_change_pct,
+        turnover_rate=turnover_rate,
+        volume=volume,
+        amount=amount,
+        volume_ratio=volume_ratio,
+        is_limit_up=is_limit_up,
+        is_sealed_board=is_sealed_board,
+        opened_after_seal=opened_after_seal,
+        intraday_sample_interval_minutes=DEFAULT_INTRADAY_SAMPLE_INTERVAL_MINUTES if intraday_samples else None,
+        intraday_source="eastmoney_trends2" if intraday_samples else None,
+        intraday_samples=intraday_samples or None,
+    )
+    merged = [bar for bar in bars if bar.trade_date != trade_date]
+    merged.append(current_bar)
+    return merged[-recent_days:]
 
 
 def first_chart_result(payload: dict[str, Any], ticker: str) -> dict[str, Any]:
@@ -340,23 +635,61 @@ def parse_yahoo_recent_bars(
         if close is None:
             continue
         trade_date = datetime.fromtimestamp(int(raw_timestamp), timezone.utc).date().isoformat()
-        bars.append(RecentQuoteBar(trade_date=trade_date, close=to_float(close)))
+        bars.append(
+            RecentQuoteBar(
+                trade_date=trade_date,
+                close=to_float(close),
+                volume=to_float((quote_rows.get("volume") or [None] * (index + 1))[index])
+                if index < len(quote_rows.get("volume") or [])
+                else None,
+            )
+        )
     return bars
 
 
 def attach_recent_change_pct(bars: list[RecentQuoteBar]) -> list[RecentQuoteBar]:
+    return attach_recent_metrics(bars)
+
+
+def attach_recent_metrics(
+    bars: list[RecentQuoteBar],
+    *,
+    volume_average_window: int = 5,
+) -> list[RecentQuoteBar]:
     if not bars:
         return []
     enriched = []
     previous_close = None
-    for bar in bars:
+    for index, bar in enumerate(bars):
         change = pct_change(bar.close, previous_close)
+        prior_volumes = [
+            item.volume
+            for item in bars[max(0, index - volume_average_window) : index]
+            if item.volume not in (None, 0)
+        ]
+        if prior_volumes and bar.volume is not None:
+            volume_ratio = round(bar.volume / (sum(prior_volumes) / len(prior_volumes)), 4)
+        else:
+            volume_ratio = None
         enriched.append(
             RecentQuoteBar(
                 trade_date=bar.trade_date,
+                open=bar.open,
                 close=bar.close,
+                high=bar.high,
+                low=bar.low,
+                previous_close=previous_close,
                 change_pct=change,
                 turnover_rate=bar.turnover_rate,
+                volume=bar.volume,
+                amount=bar.amount,
+                volume_ratio=volume_ratio,
+                is_limit_up=bar.is_limit_up,
+                is_sealed_board=bar.is_sealed_board,
+                opened_after_seal=bar.opened_after_seal,
+                intraday_sample_interval_minutes=bar.intraday_sample_interval_minutes,
+                intraday_source=bar.intraday_source,
+                intraday_samples=bar.intraday_samples,
             )
         )
         if bar.close is not None:
@@ -373,48 +706,42 @@ def parse_tencent_timestamp(value: str | None) -> datetime | None:
         return None
 
 
-def classify_intraday_shape(
+def a_share_limit_pct(code: str, name: str | None = None) -> float:
+    normalized_name = name or ""
+    if "ST" in normalized_name.upper() or "退" in normalized_name:
+        return 5.0
+    if code.startswith(("300", "301", "688", "689")):
+        return 20.0
+    if code.startswith(("8", "4", "920")):
+        return 30.0
+    return 10.0
+
+
+def estimate_a_share_limit_up(
     *,
-    open_price: float | None,
+    high_price: float | None,
+    previous_close: float | None,
+    limit_pct: float,
+) -> bool | None:
+    high_pct = pct_change(high_price, previous_close)
+    if high_pct is None:
+        return None
+    return high_pct >= limit_pct - 0.2
+
+
+def estimate_a_share_sealed_board(
+    *,
     latest_price: float | None,
     previous_close: float | None,
-    high_price: float | None,
-    low_price: float | None,
+    limit_pct: float,
     is_limit_up: bool | None,
-) -> str | None:
-    if open_price is None or latest_price is None or previous_close in (None, 0):
+) -> bool | None:
+    if not is_limit_up:
+        return False if is_limit_up is False else None
+    latest_pct = pct_change(latest_price, previous_close)
+    if latest_pct is None:
         return None
-
-    gap_pct = pct_change(open_price, previous_close)
-    move_pct = pct_change(latest_price, open_price)
-    day_pct = pct_change(latest_price, previous_close)
-    amplitude = None
-    if high_price is not None and low_price is not None and previous_close:
-        amplitude = (high_price - low_price) / previous_close * 100
-
-    if is_limit_up and near(open_price, latest_price) and near(high_price, low_price):
-        return "一字板"
-    if gap_pct is not None and move_pct is not None:
-        if gap_pct >= 0.5 and move_pct >= 0.5:
-            return "高开高走"
-        if gap_pct <= -0.5 and move_pct >= 1.0:
-            return "低开高走"
-        if gap_pct >= 0.5 and move_pct <= -0.5:
-            return "高开低走"
-    if day_pct is not None:
-        if day_pct <= -1.0 and (move_pct is None or move_pct <= 0.3):
-            return "弱势下跌"
-        if day_pct >= 1.0:
-            return "走强"
-        if abs(day_pct) < 1.0 and (amplitude is None or amplitude <= 3.0):
-            return "震荡"
-    return "日线粗略走势"
-
-
-def estimate_a_share_limit_up(change_pct: float | None) -> bool | None:
-    if change_pct is None:
-        return None
-    return change_pct >= 9.8
+    return latest_pct >= limit_pct - 0.2
 
 
 def pct_change(current: float | None, previous: float | None) -> float | None:
@@ -455,29 +782,44 @@ def snapshot_to_dict(snapshot: QuoteSnapshot) -> dict[str, Any]:
         "name": snapshot.symbol.name,
         "source": snapshot.source,
         "timestamp": snapshot.timestamp.isoformat(),
-        "latest_price": snapshot.latest_price,
-        "open_price": snapshot.open_price,
-        "close_price": snapshot.close_price,
-        "high_price": snapshot.high_price,
-        "low_price": snapshot.low_price,
-        "previous_close": snapshot.previous_close,
-        "change_pct": snapshot.change_pct,
-        "turnover_rate": snapshot.turnover_rate,
-        "intraday_shape": snapshot.intraday_shape,
-        "is_limit_up": snapshot.is_limit_up,
-        "is_sealed_board": snapshot.is_sealed_board,
-        "opened_after_seal": snapshot.opened_after_seal,
-        "recent_bars": [
-            {
-                "trade_date": bar.trade_date,
-                "close": bar.close,
-                "change_pct": bar.change_pct,
-                "turnover_rate": bar.turnover_rate,
-            }
-            for bar in snapshot.recent_bars
-        ],
+        "recent_bars": [recent_bar_to_dict(bar) for bar in reversed(snapshot.recent_bars)],
         "missing_fields": snapshot.missing_fields,
     }
+
+
+def recent_bar_to_dict(bar: RecentQuoteBar) -> dict[str, Any]:
+    data: dict[str, Any] = {
+        "trade_date": bar.trade_date,
+        "open": bar.open,
+        "close": bar.close,
+        "high": bar.high,
+        "low": bar.low,
+        "previous_close": bar.previous_close,
+        "change_pct": bar.change_pct,
+        "turnover_rate": bar.turnover_rate,
+        "volume": bar.volume,
+        "amount": bar.amount,
+        "volume_ratio": bar.volume_ratio,
+        "is_limit_up": bar.is_limit_up,
+        "is_sealed_board": bar.is_sealed_board,
+        "opened_after_seal": bar.opened_after_seal,
+        "intraday_sample_interval_minutes": bar.intraday_sample_interval_minutes,
+        "intraday_source": bar.intraday_source,
+    }
+    data = {key: value for key, value in data.items() if value is not None}
+    if bar.intraday_samples is not None:
+        data["intraday_samples"] = [
+            {
+                "timestamp": point.timestamp,
+                "price": point.price,
+                "change_pct": point.change_pct,
+                "average_price": point.average_price,
+                "volume": point.volume,
+                "amount": point.amount,
+            }
+            for point in bar.intraday_samples
+        ]
+    return data
 
 
 def snapshots_to_json(snapshots: list[QuoteSnapshot]) -> str:
@@ -485,12 +827,24 @@ def snapshots_to_json(snapshots: list[QuoteSnapshot]) -> str:
         [snapshot_to_dict(snapshot) for snapshot in snapshots],
         ensure_ascii=False,
         indent=2,
-        sort_keys=True,
     )
 
 
 def snapshots_to_table(snapshots: list[QuoteSnapshot]) -> str:
-    headers = ["symbol", "market", "name", "latest", "chg%", "open", "close", "turnover", "shape", "missing", "source"]
+    headers = [
+        "symbol",
+        "market",
+        "name",
+        "latest",
+        "chg%",
+        "open",
+        "close",
+        "turnover",
+        "vol_ratio",
+        "intraday_pts",
+        "missing",
+        "source",
+    ]
     rows = []
     for snapshot in snapshots:
         rows.append(
@@ -503,12 +857,20 @@ def snapshots_to_table(snapshots: list[QuoteSnapshot]) -> str:
                 fmt(snapshot.open_price),
                 fmt(snapshot.close_price),
                 fmt(snapshot.turnover_rate),
-                snapshot.intraday_shape or "",
+                fmt(snapshot.volume_ratio),
+                str(intraday_point_count(snapshot)),
                 str(len(snapshot.missing_fields)),
                 snapshot.source,
             ]
         )
     return format_table(headers, rows)
+
+
+def intraday_point_count(snapshot: QuoteSnapshot) -> int:
+    for bar in reversed(snapshot.recent_bars):
+        if bar.intraday_samples is not None:
+            return len(bar.intraday_samples)
+    return 0
 
 
 def format_table(headers: list[str], rows: list[list[str]]) -> str:

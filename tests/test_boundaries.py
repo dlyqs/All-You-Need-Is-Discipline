@@ -2,18 +2,17 @@ from pathlib import Path
 import unittest
 
 from trading_agent.market_data import build_quote_request
-from trading_agent.memory import MEMORY_FILENAMES, expected_memory_paths
+from trading_agent.cli import MEMORY_FILENAMES, expected_memory_paths
 from trading_agent.skills import SKILL_FILENAMES, build_skill_request
 
 
 class BoundaryTest(unittest.TestCase):
-    def test_memory_contract_has_three_files(self):
+    def test_memory_contract_has_two_files(self):
         self.assertEqual(
             MEMORY_FILENAMES,
-            ("user_profile.md", "portfolio.md", "watchlist.md"),
+            ("portfolio.md", "watchlist.md"),
         )
         paths = expected_memory_paths(Path("/tmp/project"))
-        self.assertEqual(paths.user_profile.name, "user_profile.md")
         self.assertEqual(paths.portfolio.name, "portfolio.md")
         self.assertEqual(paths.watchlist.name, "watchlist.md")
 

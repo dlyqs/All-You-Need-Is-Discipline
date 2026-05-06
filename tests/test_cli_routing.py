@@ -26,29 +26,30 @@ class CliRoutingTest(unittest.TestCase):
         self.assertEqual(packet["skill_packet"]["skill_id"], "target_screening")
         self.assertIn("chain=agent", stderr)
 
-    def test_update_memory_reports_missing_fields(self):
+    def test_update_memory_outputs_skill_packet(self):
         code, stdout, stderr = self.run_cli(["update-memory", "我买了", "NVDA", "--format", "json"])
 
         self.assertEqual(code, 0)
         packet = json.loads(stdout)
-        self.assertEqual(packet["status"], "needs_confirmation")
-        self.assertEqual(packet["memory_update"]["action"], "buy")
-        self.assertIn("quantity", packet["memory_update"]["missing_fields"])
+        self.assertEqual(packet["status"], "ready")
+        self.assertEqual(packet["skill_packet"]["skill_id"], "memory_update")
         self.assertIn("chain=cli", stderr)
 
+    def test_update_memory_includes_user_text_in_packet(self):
+        code, stdout, _stderr = self.run_cli(["update-memory", "我买了 NVDA", "--format", "json"])
+
+        self.assertEqual(code, 0)
+        packet = json.loads(stdout)
+        self.assertEqual(packet["status"], "ready")
+        self.assertIn("我买了 NVDA", packet["skill_packet"]["prompt"])
+
     def test_update_memory_ignores_analysis_question(self):
+        """update-memory always builds a skill packet; it does not parse intent."""
         code, stdout, _stderr = self.run_cli(["update-memory", "帮我判断", "NVDA", "能不能加仓", "--format", "json"])
 
         self.assertEqual(code, 0)
         packet = json.loads(stdout)
-        self.assertEqual(packet["status"], "no_update_detected")
-
-    def test_update_memory_ignores_planned_trade_intent(self):
-        code, stdout, _stderr = self.run_cli(["update-memory", "我准备加仓", "NVDA", "--format", "json"])
-
-        self.assertEqual(code, 0)
-        packet = json.loads(stdout)
-        self.assertEqual(packet["status"], "no_update_detected")
+        self.assertEqual(packet["status"], "ready")
 
     def test_output_packet_writes_file(self):
         with patch("pathlib.Path.write_text") as write_text:
